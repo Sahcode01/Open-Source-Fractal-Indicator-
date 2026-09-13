@@ -1,0 +1,257 @@
+//@version=6
+strategy("Fractal FVG/IFVG Strategy [1H bias -> 5m FVG -> 1m IFVG entry]",
+     overlay = true,
+     initial_capital = 10000,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     pyramiding = 0,
+     process_orders_on_close = true,
+     calc_on_every_tick = true,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.0)
+
+// ============================================================================
+// READ ME FIRST
+// ----------------------------------------------------------------------------
+// - This script MUST be run on a 1-minute chart. It pulls 1H data (HTF bias /
+//   sweep model) and 5m data (FVG zone) via request.security, and does the
+//   IFVG + entry logic natively on the 1m bars.
+// - All higher-timeframe data uses lookahead_off (closed bars only) so the
+//   backtest does not use look-ahead information. This is slightly less
+//   "live/responsive" than the original indicator (which used lookahead_on)
+//   but is required for the win-rate / drawdown numbers to mean anything.
+// - The original indicator's CISD-fixed-level / std-dev-projection / dashboard
+//   machinery is not needed for this entry method and was removed. The C2
+//   trigger below is: on a closed 1H bar, low swept below the prior closed 1H
+//   low (or high swept above prior high) and the bar closed back inside
+//   (reclaim). That closed bar becomes "C2". The next 1H period is "C3", the
+//   one after that is "C4"; beyond that the setup expires.
+// - Only ONE trade is taken per HTF setup (first valid 1m IFVG retest).
+// - Stop-loss = the swing extreme (low for longs / high for shorts) spanning
+//   from the moment the 1m FVG formed to the moment it inverted.
+// - Take-profit = 2R. A 1R level is plotted as a reference line only (no
+//   partial exit there), per your spec.
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// INPUTS
+// ---------------------------------------------------------------------------
+grpGeneral   = "General"
+biasFilter   = input.string("Neutral", "Bias", options = ["Neutral", "Bullish", "Bearish"], group = grpGeneral)
+riskPerTrade = input.float(1.0, "Risk % of equity per trade", minval = 0.01, step = 0.1, group = grpGeneral)
+htfTF        = input.timeframe("60", "HTF (bias / sweep) timeframe", group = grpGeneral)
+midTF        = input.timeframe("5",  "Mid TF (FVG zone) timeframe",  group = grpGeneral)
+
+grpVis = "Visuals"
+showVisuals = input.bool(true, "Show zones / trade lines", group = grpVis)
+showRefLine = input.bool(true, "Show 1R reference line", group = grpVis)
+
+allowBuy  = biasFilter != "Bearish"
+allowSell = biasFilter != "Bullish"
+
+if timeframe.period != "1"
+    label.new(bar_index, high, "⚠ Switch chart to 1-minute\nfor this strategy to work correctly",
+         style = label.style_label_down, color = color.new(color.red, 0), textcolor = color.white)
+
+// ---------------------------------------------------------------------------
+// 1) HTF (1H) SWEEP + RECLAIM MODEL  -> defines C2 / C3 / C4 phase per direction
+// ---------------------------------------------------------------------------
+[htfH, htfL, htfC, htfHp1, htfLp1, htfT] = request.security(syminfo.tickerid, htfTF,
+     [high, low, close, high[1], low[1], time], lookahead = barmerge.lookahead_off)
+
+htfNewBar = ta.change(htfT) != 0
+
+c2BuyConfirmed  = htfNewBar and htfL < htfLp1 and htfC > htfLp1
+c2SellConfirmed = htfNewBar and htfH > htfHp1 and htfC < htfHp1
+
+var bool  setupActiveBull  = false
+var int   setupPhaseBull   = 0     // 1 = C3, 2 = C4
+var float setupExtremeBull = na    // the swept HTF low; a re-sweep below this kills the setup
+var int   setupIdBull      = na
+var bool  tradeTakenBull   = false
+
+var bool  setupActiveBear  = false
+var int   setupPhaseBear   = 0
+var float setupExtremeBear = na
+var int   setupIdBear      = na
+var bool  tradeTakenBear   = false
+
+// -- bullish setup lifecycle --
+if c2BuyConfirmed and allowBuy
+    setupActiveBull  := true
+    setupPhaseBull   := 1
+    setupExtremeBull := htfLp1
+    setupIdBull      := bar_index
+    tradeTakenBull   := false
+else if htfNewBar and setupActiveBull
+    setupPhaseBull += 1
+    if setupPhaseBull > 2
+        setupActiveBull := false
+        setupPhaseBull  := 0
+
+if setupActiveBull and low < setupExtremeBull
+    setupActiveBull := false
+    setupPhaseBull  := 0
+
+// -- bearish setup lifecycle --
+if c2SellConfirmed and allowSell
+    setupActiveBear  := true
+    setupPhaseBear   := 1
+    setupExtremeBear := htfHp1
+    setupIdBear      := bar_index
+    tradeTakenBear   := false
+else if htfNewBar and setupActiveBear
+    setupPhaseBear += 1
+    if setupPhaseBear > 2
+        setupActiveBear := false
+        setupPhaseBear  := 0
+
+if setupActiveBear and high > setupExtremeBear
+    setupActiveBear := false
+    setupPhaseBear  := 0
+
+// ---------------------------------------------------------------------------
+// 2) MID TF (5m) FVG DETECTION -> "does price reach into a FVG during C3/C4"
+// ---------------------------------------------------------------------------
+[m_h0, m_h1, m_h2, m_l0, m_l1, m_l2, m_t] = request.security(syminfo.tickerid, midTF,
+     [high, high[1], high[2], low, low[1], low[2], time], lookahead = barmerge.lookahead_off)
+
+new5m = ta.change(m_t) != 0
+
+bull5FVG = new5m and m_l0 > m_h2   // bullish (support) gap on the 5m
+bull5Top = m_l0
+bull5Bot = m_h2
+
+bear5FVG = new5m and m_h0 < m_l2   // bearish (resistance) gap on the 5m
+bear5Top = m_l2
+bear5Bot = m_h0
+
+var float pend5TopBull = na
+var float pend5BotBull = na
+var bool  huntingBull  = false     // true once price has tagged the 5m bullish FVG
+
+var float pend5TopBear = na
+var float pend5BotBear = na
+var bool  huntingBear  = false
+
+// only track a fresh 5m FVG while the corresponding HTF setup is in C3/C4 and not yet hunting
+if setupActiveBull and setupPhaseBull > 0 and not huntingBull and bull5FVG
+    pend5TopBull := bull5Top
+    pend5BotBull := bull5Bot
+
+if setupActiveBear and setupPhaseBear > 0 and not huntingBear and bear5FVG
+    pend5TopBear := bear5Top
+    pend5BotBear := bear5Bot
+
+if not na(pend5TopBull) and not huntingBull and low <= pend5TopBull
+    huntingBull := true
+
+if not na(pend5TopBear) and not huntingBear and high >= pend5BotBear
+    huntingBear := true
+
+// reset hunting / pending zones if the HTF setup dies before a trade is taken
+if not setupActiveBull
+    huntingBull  := false
+    pend5TopBull := na
+    pend5BotBull := na
+
+if not setupActiveBear
+    huntingBear  := false
+    pend5TopBear := na
+    pend5BotBear := na
+
+// ---------------------------------------------------------------------------
+// 3) 1m FVG -> IFVG -> RETEST ENTRY
+// ---------------------------------------------------------------------------
+bull1FVG = low > high[2]     // native 1m bullish FVG
+bull1Top = low
+bull1Bot = high[2]
+
+bear1FVG = high < low[2]     // native 1m bearish FVG
+bear1Top = low[2]
+bear1Bot = high
+
+// --- BULL side: we hunt a BEARISH 1m FVG (formed on the way down into the
+//     5m zone) that later gets inverted (closed back above it) into support.
+var float candBearTop   = na
+var float candBearBot   = na
+var bool  candBearActive   = false
+var bool  candBearInverted = false
+var float candBearStop  = na   // running swing-low extreme across the candidate's life
+
+if huntingBull and not tradeTakenBull and bear1FVG
+    candBearTop      := bear1Top
+    candBearBot      := bear1Bot
+    candBearActive   := true
+    candBearInverted := false
+    candBearStop     := low
+
+if candBearActive
+    candBearStop := math.min(candBearStop, low)
+    if not candBearInverted and close > candBearTop
+        candBearInverted := true
+    if candBearInverted and low <= candBearTop and low >= candBearBot and allowBuy and not tradeTakenBull
+        entryPx  = close
+        stopPx   = candBearStop
+        rr       = entryPx - stopPx
+        if rr > 0
+            targetPx = entryPx + 2 * rr
+            refPx    = entryPx + 1 * rr
+            riskAmt  = strategy.equity * (riskPerTrade / 100)
+            qty      = riskAmt / rr
+            strategy.entry("Long", strategy.long, qty = qty)
+            strategy.exit("Long Exit", "Long", stop = stopPx, limit = targetPx)
+            tradeTakenBull := true
+            candBearActive := false
+            huntingBull    := false
+            if showVisuals
+                line.new(bar_index, stopPx, bar_index + 20, stopPx, color = color.red, style = line.style_dashed)
+                line.new(bar_index, targetPx, bar_index + 20, targetPx, color = color.green, style = line.style_dashed)
+                if showRefLine
+                    line.new(bar_index, refPx, bar_index + 20, refPx, color = color.gray, style = line.style_dotted)
+                box.new(bar_index[0], candBearTop, bar_index, candBearBot, border_color = color.new(color.blue, 0), bgcolor = color.new(color.blue, 85))
+
+// --- BEAR side: mirror logic using a BULLISH 1m FVG that inverts down.
+var float candBullTop   = na
+var float candBullBot   = na
+var bool  candBullActive   = false
+var bool  candBullInverted = false
+var float candBullStop  = na   // running swing-high extreme
+
+if huntingBear and not tradeTakenBear and bull1FVG
+    candBullTop      := bull1Top
+    candBullBot      := bull1Bot
+    candBullActive   := true
+    candBullInverted := false
+    candBullStop     := high
+
+if candBullActive
+    candBullStop := math.max(candBullStop, high)
+    if not candBullInverted and close < candBullBot
+        candBullInverted := true
+    if candBullInverted and high >= candBullBot and high <= candBullTop and allowSell and not tradeTakenBear
+        entryPx  = close
+        stopPx   = candBullStop
+        rr       = stopPx - entryPx
+        if rr > 0
+            targetPx = entryPx - 2 * rr
+            refPx    = entryPx - 1 * rr
+            riskAmt  = strategy.equity * (riskPerTrade / 100)
+            qty      = riskAmt / rr
+            strategy.entry("Short", strategy.short, qty = qty)
+            strategy.exit("Short Exit", "Short", stop = stopPx, limit = targetPx)
+            tradeTakenBear := true
+            candBullActive := false
+            huntingBear    := false
+            if showVisuals
+                line.new(bar_index, stopPx, bar_index + 20, stopPx, color = color.red, style = line.style_dashed)
+                line.new(bar_index, targetPx, bar_index + 20, targetPx, color = color.green, style = line.style_dashed)
+                if showRefLine
+                    line.new(bar_index, refPx, bar_index + 20, refPx, color = color.gray, style = line.style_dotted)
+                box.new(bar_index[0], candBullTop, bar_index, candBullBot, border_color = color.new(color.orange, 0), bgcolor = color.new(color.orange, 85))
+
+// ---------------------------------------------------------------------------
+// DEBUG PLOTS (optional)
+// ---------------------------------------------------------------------------
+plotshape(showVisuals and c2BuyConfirmed,  "C2 Buy",  shape.triangleup,   location.belowbar, color.new(color.green, 0), size = size.tiny)
+plotshape(showVisuals and c2SellConfirmed, "C2 Sell", shape.triangledown, location.abovebar, color.new(color.red, 0),   size = size.tiny)
