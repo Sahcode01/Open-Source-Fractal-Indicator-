@@ -1,0 +1,298 @@
+//@version=6
+strategy("HTF Fractal (C3/C4) -> LTF CISD Retest Strategy", overlay = true,
+     initial_capital = 10000, currency = currency.USD,
+     default_qty_type = strategy.fixed, default_qty_value = 1,
+     calc_on_every_tick = true, process_orders_on_close = false)
+
+// =========================================================================
+// HOW THIS WORKS
+// -------------------------------------------------------------------------
+// 1) Run this on the 1-minute chart (the LTF). Set "HTF Timeframe" to "60".
+// 2) On the HTF (1H), the script watches for a C2 (a 1H candle that sweeps
+//    the prior 1H candle's high/low and closes back through it). The next
+//    HTF candle is treated as "C3", the one after that as "C4". Only while
+//    the HTF is inside that C3/C4 window is the LTF side allowed to look
+//    for trades, in the direction of that HTF C2 (bull or bear).
+// 3) On the 1m chart, a "C2" is a 1m candle sweeping the prior 1m candle's
+//    high/low and closing back through it, in the same direction as the
+//    HTF bias.
+// 4) The moment that 1m C2 forms, the script scans back through the 1m
+//    candles to find the CISD level (the origin open of the opposite-
+//    colour candle run right before the reversal). CISD is "confirmed"
+//    once a close pushes back through that level (often the same bar).
+// 5) Once confirmed, a LIMIT order is placed AT the CISD level (the
+//    retest). Stop goes beyond the low/high of the 1m C2 candle. Target
+//    is the R:R multiple you set (default 1:1) measured from entry.
+// 6) If price breaks the C2 extreme before the retest fills, the setup is
+//    cancelled. If the retest doesn't fill within "Max Bars to Wait", it's
+//    cancelled too.
+// =========================================================================
+
+// ============================ INPUTS ====================================
+grpHtf     = "HTF Fractal"
+htfTF      = input.timeframe("60", "HTF Timeframe (C2 -> C3 -> C4)", group = grpHtf)
+biasFilter = input.string("Neutral", "Bias Filter", options = ["Neutral", "Bullish", "Bearish"], group = grpHtf)
+
+grpLtf          = "LTF Entry (CISD Retest)"
+maxWaitBars     = input.int(30, "Max Bars to Wait for Retest Fill", minval = 1, group = grpLtf)
+stopBufferTicks = input.int(2, "Stop Buffer (ticks beyond C2 low/high)", minval = 0, group = grpLtf)
+rrTarget        = input.float(1.0, "Target R:R Multiple", minval = 0.1, step = 0.1, group = grpLtf)
+
+grpRisk = "Risk / Sizing"
+riskPct = input.float(1.0, "Risk % of Equity per Trade", minval = 0.01, step = 0.1, group = grpRisk)
+
+grpAlerts  = "Alerts"
+showAlerts = input.bool(true, "Enable Alerts", group = grpAlerts)
+
+grpVis      = "Visuals"
+showVisuals = input.bool(true, "Show Debug Visuals", group = grpVis)
+
+allowBuy  = biasFilter != "Bearish"
+allowSell = biasFilter != "Bullish"
+
+// ============================ HTF LAYER (C2 -> C3 -> C4) ================
+[hO, hH, hL, hC, hPH, hPL] = request.security(syminfo.tickerid, htfTF,
+     [open, high, low, close, high[1], low[1]], lookahead = barmerge.lookahead_on)
+
+htfPeriodChanged = time(htfTF) != time(htfTF)[1]
+
+hC2Buy  = hL < hPL and hC > hPL
+hC2Sell = hH > hPH and hC < hPH
+
+var bool  armBuy    = false
+var bool  armSell   = false
+var float sweptLow  = na
+var float sweptHigh = na
+
+if htfPeriodChanged
+    armBuy    := hC2Buy[1]
+    armSell   := hC2Sell[1]
+    sweptLow  := hL[1]
+    sweptHigh := hH[1]
+
+htfC2Buy  = htfPeriodChanged and armBuy
+htfC2Sell = htfPeriodChanged and armSell
+
+var int   htfPhase   = 0     // 0 = inactive, 1 = C3, 2 = C4
+var bool  htfBull    = na
+var float htfExtreme = na
+
+if htfC2Buy
+    htfPhase   := 1
+    htfBull    := true
+    htfExtreme := sweptLow
+else if htfC2Sell
+    htfPhase   := 1
+    htfBull    := false
+    htfExtreme := sweptHigh
+else if htfPeriodChanged and htfPhase == 1
+    htfPhase   := 2
+else if htfPeriodChanged and htfPhase == 2
+    htfPhase   := 0
+    htfBull    := na
+    htfExtreme := na
+
+if htfPhase != 0 and not na(htfExtreme)
+    htfInvalid = htfBull ? close < htfExtreme : close > htfExtreme
+    if htfInvalid
+        htfPhase   := 0
+        htfBull    := na
+        htfExtreme := na
+
+htfActive = htfPhase == 1 or htfPhase == 2
+
+bgcolor(showVisuals and htfActive ? (htfBull ? color.new(color.green, 90) : color.new(color.red, 90)) : na, title = "HTF C3/C4 Window")
+
+// ============================ LTF C2 (1m) ================================
+upC = close > open
+dwC = close < open
+eqC = close == open
+
+ltfC2Buy  = low  < low[1]  and close > low[1]
+ltfC2Sell = high > high[1] and close < high[1]
+
+bullCisd() =>
+    float lvl = na
+    int   idx = na
+    if (dwC or eqC) and (upC[1] or eqC[1]) and not (eqC and eqC[1])
+        lvl := open
+        idx := bar_index
+    else
+        for i = 2 to 10
+            if low[i] < low
+                break
+            if (upC[i] or eqC[i]) and dwC[i - 1]
+                b = i - 1
+                lvl := open[b]
+                idx := bar_index - b
+                for j = b to 0
+                    if open[j] > lvl and dwC[j]
+                        lvl := open[j]
+                        idx := bar_index - j
+                if lvl < open
+                    lvl := close > open ? high : open
+                    idx := bar_index
+                break
+    [lvl, idx]
+
+bearCisd() =>
+    float lvl = na
+    int   idx = na
+    if (upC or eqC) and (dwC[1] or eqC[1]) and not (eqC and eqC[1])
+        lvl := open
+        idx := bar_index
+    else
+        for i = 2 to 10
+            if high[i] > high
+                break
+            if (dwC[i] or eqC[i]) and upC[i - 1]
+                b = i - 1
+                lvl := open[b]
+                idx := bar_index - b
+                for j = b to 0
+                    if open[j] < lvl and upC[j]
+                        lvl := open[j]
+                        idx := bar_index - j
+                if lvl > open
+                    lvl := close < open ? low : open
+                    idx := bar_index
+                break
+    [lvl, idx]
+
+// ============================ PENDING SETUP STATE ========================
+var float pendLevel     = na
+var float pendExtreme   = na
+var bool  pendBull      = na
+var bool  pendConfirmed = false
+var int   confirmBar    = na
+var line  cisdLn        = na
+var line  stopLn        = na
+var line  targetLn      = na
+
+canArm = htfActive and na(pendLevel) and strategy.position_size == 0
+
+if canArm and htfBull and allowBuy and ltfC2Buy
+    [lvl, idx] = bullCisd()
+    if not na(lvl)
+        pendLevel     := lvl
+        pendExtreme   := low
+        pendBull      := true
+        pendConfirmed := false
+        confirmBar    := na
+        if showAlerts
+            alert("1m Bullish C2 formed, watching for CISD confirm on " + syminfo.ticker, alert.freq_once_per_bar)
+
+if canArm and not htfBull and allowSell and ltfC2Sell
+    [lvl, idx] = bearCisd()
+    if not na(lvl)
+        pendLevel     := lvl
+        pendExtreme   := high
+        pendBull      := false
+        pendConfirmed := false
+        confirmBar    := na
+        if showAlerts
+            alert("1m Bearish C2 formed, watching for CISD confirm on " + syminfo.ticker, alert.freq_once_per_bar)
+
+// invalidate pending (pre- or post-confirm) if price breaks back through the C2 extreme with no fill yet
+if not na(pendLevel) and strategy.position_size == 0
+    breached = pendBull ? low < pendExtreme : high > pendExtreme
+    if breached
+        strategy.cancel("Long")
+        strategy.cancel("Short")
+        if not na(cisdLn)
+            line.delete(cisdLn)
+            cisdLn := na
+        pendLevel     := na
+        pendExtreme   := na
+        pendBull      := na
+        pendConfirmed := false
+        confirmBar    := na
+
+// confirm CISD
+if not na(pendLevel) and not pendConfirmed
+    confirmed = pendBull ? close > pendLevel : close < pendLevel
+    if confirmed
+        pendConfirmed := true
+        confirmBar    := bar_index
+        if showAlerts
+            alert((pendBull ? "Bullish" : "Bearish") + " CISD confirmed, waiting for retest entry on " + syminfo.ticker, alert.freq_once_per_bar)
+
+// draw / extend the CISD level line
+if showVisuals and not na(pendLevel)
+    if na(cisdLn)
+        cisdLn := line.new(bar_index, pendLevel, bar_index, pendLevel, color = pendBull ? color.blue : color.orange, style = line.style_dashed, width = 1)
+    else
+        line.set_xy2(cisdLn, bar_index, pendLevel)
+
+// manage the retest entry order while confirmed & unfilled
+if pendConfirmed and strategy.position_size == 0
+    if bar_index - confirmBar > maxWaitBars
+        strategy.cancel("Long")
+        strategy.cancel("Short")
+        if not na(cisdLn)
+            line.delete(cisdLn)
+            cisdLn := na
+        pendLevel     := na
+        pendExtreme   := na
+        pendBull      := na
+        pendConfirmed := false
+        confirmBar    := na
+    else
+        stopPx   = pendBull ? pendExtreme - stopBufferTicks * syminfo.mintick : pendExtreme + stopBufferTicks * syminfo.mintick
+        riskUnit = pendBull ? pendLevel - stopPx : stopPx - pendLevel
+        if riskUnit > 0
+            qty = (strategy.equity * riskPct / 100) / (riskUnit * syminfo.pointvalue)
+            if pendBull
+                strategy.entry("Long", strategy.long, qty = qty, limit = pendLevel)
+            else
+                strategy.entry("Short", strategy.short, qty = qty, limit = pendLevel)
+
+// set stop / target once filled
+if strategy.position_size > 0 and pendBull
+    stopPx   = pendExtreme - stopBufferTicks * syminfo.mintick
+    riskUnit = pendLevel - stopPx
+    targetPx = pendLevel + riskUnit * rrTarget
+    strategy.exit("XLong", "Long", stop = stopPx, limit = targetPx)
+    if showVisuals
+        if na(stopLn)
+            stopLn   := line.new(bar_index, stopPx, bar_index, stopPx, color = color.red, style = line.style_dotted)
+            targetLn := line.new(bar_index, targetPx, bar_index, targetPx, color = color.green, style = line.style_dotted)
+        else
+            line.set_xy2(stopLn, bar_index, stopPx)
+            line.set_xy2(targetLn, bar_index, targetPx)
+
+if strategy.position_size < 0 and not pendBull
+    stopPx   = pendExtreme + stopBufferTicks * syminfo.mintick
+    riskUnit = stopPx - pendLevel
+    targetPx = pendLevel - riskUnit * rrTarget
+    strategy.exit("XShort", "Short", stop = stopPx, limit = targetPx)
+    if showVisuals
+        if na(stopLn)
+            stopLn   := line.new(bar_index, stopPx, bar_index, stopPx, color = color.red, style = line.style_dotted)
+            targetLn := line.new(bar_index, targetPx, bar_index, targetPx, color = color.green, style = line.style_dotted)
+        else
+            line.set_xy2(stopLn, bar_index, stopPx)
+            line.set_xy2(targetLn, bar_index, targetPx)
+
+// reset everything once the trade is fully closed
+var float prevPosSize = 0.0
+if strategy.position_size == 0 and prevPosSize != 0
+    if not na(cisdLn)
+        line.delete(cisdLn)
+        cisdLn := na
+    if not na(stopLn)
+        line.delete(stopLn)
+        stopLn := na
+    if not na(targetLn)
+        line.delete(targetLn)
+        targetLn := na
+    pendLevel     := na
+    pendExtreme   := na
+    pendBull      := na
+    pendConfirmed := false
+    confirmBar    := na
+prevPosSize := strategy.position_size
+
+// ============================ PLOTS ======================================
+plotshape(showVisuals and ltfC2Buy,  title = "1m Bull C2", style = shape.triangleup,   location = location.belowbar, color = color.blue,   size = size.tiny)
+plotshape(showVisuals and ltfC2Sell, title = "1m Bear C2", style = shape.triangledown, location = location.abovebar, color = color.orange, size = size.tiny)
